@@ -14,6 +14,7 @@ use tracing::debug;
 
 use crate::oauth::StoredOAuthTokenStatus;
 use crate::oauth::oauth_token_status;
+use crate::oauth_discovery::discover_protected_resource_oauth_metadata;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
@@ -131,6 +132,13 @@ async fn discover_streamable_http_oauth_with_headers(
                 scopes_supported: normalize_scopes(metadata.scopes_supported),
             }));
         }
+    }
+
+    if let Some(discovery) = discover_protected_resource_oauth_metadata(&client, &base_url).await {
+        return Ok(Some(StreamableHttpOAuthDiscovery {
+            scopes_supported: normalize_scopes(discovery.scopes_supported)
+                .or_else(|| normalize_scopes(discovery.authorization_metadata.scopes_supported)),
+        }));
     }
 
     if let Some(err) = last_error {
