@@ -5,6 +5,7 @@ use anyhow::Result;
 use codex_protocol::protocol::McpAuthStatus;
 use futures::FutureExt;
 use reqwest::Client;
+use reqwest::Url;
 use reqwest::header::AUTHORIZATION;
 use reqwest::header::HeaderMap;
 use rmcp::transport::AuthorizationManager;
@@ -13,6 +14,7 @@ use tracing::debug;
 
 use crate::oauth::StoredOAuthTokenStatus;
 use crate::oauth::oauth_token_status;
+use crate::oauth_discovery::discover_protected_resource_oauth_metadata;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
@@ -90,13 +92,27 @@ async fn discover_streamable_http_oauth_with_headers(
     // can result in a panic. See #8912.
     let builder = Client::builder().timeout(DISCOVERY_TIMEOUT).no_proxy();
     let client = apply_default_headers(builder, default_headers).build()?;
+    let fallback_client = client.clone();
     let mut authorization_manager = AuthorizationManager::new(url).await?;
     authorization_manager.with_client(client)?;
     match authorization_manager.discover_metadata().boxed().await {
         Ok(metadata) => Ok(Some(StreamableHttpOAuthDiscovery {
             scopes_supported: normalize_scopes(metadata.scopes_supported),
         })),
-        Err(AuthError::NoAuthorizationSupport) => Ok(None),
+        Err(AuthError::NoAuthorizationSupport) => {
+            let base_url = Url::parse(url)?;
+            if let Some(discovery) =
+                discover_protected_resource_oauth_metadata(&fallback_client, &base_url).await
+            {
+                return Ok(Some(StreamableHttpOAuthDiscovery {
+                    scopes_supported: normalize_scopes(discovery.scopes_supported).or_else(|| {
+                        normalize_scopes(discovery.authorization_metadata.scopes_supported)
+                    }),
+                }));
+            }
+
+            Ok(None)
+        }
         Err(err) => Err(err.into()),
     }
 }
