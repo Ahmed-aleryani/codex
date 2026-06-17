@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
@@ -7,6 +9,7 @@ use tracing::debug;
 
 const OAUTH_DISCOVERY_HEADER: &str = "MCP-Protocol-Version";
 const OAUTH_DISCOVERY_VERSION: &str = "2024-11-05";
+const OAUTH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProtectedResourceOAuthDiscovery {
@@ -28,6 +31,18 @@ pub(crate) async fn discover_protected_resource_oauth_metadata(
     client: &Client,
     base_url: &Url,
 ) -> Option<ProtectedResourceOAuthDiscovery> {
+    let issuer_client = match Client::builder()
+        .timeout(OAUTH_DISCOVERY_TIMEOUT)
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            debug!("authorization metadata discovery client creation failed: {err:?}");
+            return None;
+        }
+    };
+
     for resource_metadata_url in protected_resource_metadata_urls(base_url) {
         let resource_metadata = match fetch_resource_metadata(client, resource_metadata_url).await {
             Ok(Some(metadata)) => metadata,
@@ -40,7 +55,7 @@ pub(crate) async fn discover_protected_resource_oauth_metadata(
 
         for authorization_server in authorization_servers(&resource_metadata) {
             for metadata_url in authorization_metadata_urls(&authorization_server) {
-                match fetch_authorization_metadata(client, metadata_url).await {
+                match fetch_authorization_metadata(&issuer_client, metadata_url).await {
                     Ok(Some(authorization_metadata)) => {
                         return Some(ProtectedResourceOAuthDiscovery {
                             authorization_metadata,
@@ -52,6 +67,23 @@ pub(crate) async fn discover_protected_resource_oauth_metadata(
                         debug!("authorization metadata discovery failed: {err:?}");
                     }
                 }
+            }
+        }
+    }
+
+    None
+}
+
+pub(crate) async fn discover_authorization_metadata(
+    client: &Client,
+    authorization_server: &Url,
+) -> Option<AuthorizationMetadata> {
+    for metadata_url in authorization_metadata_urls(authorization_server) {
+        match fetch_authorization_metadata(client, metadata_url).await {
+            Ok(Some(authorization_metadata)) => return Some(authorization_metadata),
+            Ok(None) => {}
+            Err(err) => {
+                debug!("authorization metadata discovery failed: {err:?}");
             }
         }
     }
@@ -174,12 +206,18 @@ fn authorization_metadata_urls(authorization_server: &Url) -> Vec<Url> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use axum::Json;
     use axum::Router;
+    use axum::http::HeaderMap as AxumHeaderMap;
     use axum::routing::get;
     use pretty_assertions::assert_eq;
+    use reqwest::header::AUTHORIZATION;
+    use reqwest::header::HeaderMap;
+    use reqwest::header::HeaderValue;
     use serde_json::json;
     use tokio::task::JoinHandle;
 
@@ -193,6 +231,21 @@ mod tests {
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.handle.abort();
+        }
+    }
+
+    struct HeaderCaptureServer {
+        url: String,
+        resource_authorization_headers: Arc<Mutex<Vec<Option<String>>>>,
+        issuer_authorization_headers: Arc<Mutex<Vec<Option<String>>>>,
+        handles: Vec<JoinHandle<()>>,
+    }
+
+    impl Drop for HeaderCaptureServer {
+        fn drop(&mut self) {
+            for handle in &self.handles {
+                handle.abort();
+            }
         }
     }
 
@@ -242,6 +295,94 @@ mod tests {
         }
     }
 
+    async fn spawn_header_capture_discovery_server() -> HeaderCaptureServer {
+        let issuer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("issuer listener should bind");
+        let issuer_address = issuer_listener
+            .local_addr()
+            .expect("issuer listener should have address");
+        let issuer_url = format!("http://{issuer_address}/issuer");
+        let authorization_endpoint = format!("http://{issuer_address}/oauth/authorize");
+        let token_endpoint = format!("http://{issuer_address}/oauth/token");
+        let issuer_authorization_headers = Arc::new(Mutex::new(Vec::new()));
+        let issuer_headers = Arc::clone(&issuer_authorization_headers);
+        let authorization_metadata = json!({
+            "authorization_endpoint": authorization_endpoint,
+            "token_endpoint": token_endpoint,
+        });
+        let issuer_app = Router::new().route(
+            "/.well-known/oauth-authorization-server/issuer",
+            get({
+                move |headers: AxumHeaderMap| {
+                    let issuer_headers = Arc::clone(&issuer_headers);
+                    let authorization_metadata = authorization_metadata.clone();
+                    async move {
+                        let authorization_header = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        issuer_headers
+                            .lock()
+                            .expect("issuer headers lock should not be poisoned")
+                            .push(authorization_header);
+                        Json(authorization_metadata)
+                    }
+                }
+            }),
+        );
+        let issuer_handle = tokio::spawn(async move {
+            axum::serve(issuer_listener, issuer_app)
+                .await
+                .expect("issuer server should run");
+        });
+
+        let resource_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resource listener should bind");
+        let resource_address = resource_listener
+            .local_addr()
+            .expect("resource listener should have address");
+        let resource_metadata = json!({
+            "resource": format!("http://{resource_address}/mcp/"),
+            "authorization_servers": [issuer_url],
+        });
+        let resource_authorization_headers = Arc::new(Mutex::new(Vec::new()));
+        let resource_headers = Arc::clone(&resource_authorization_headers);
+        let resource_app = Router::new().route(
+            "/.well-known/oauth-protected-resource/mcp/",
+            get({
+                move |headers: AxumHeaderMap| {
+                    let resource_headers = Arc::clone(&resource_headers);
+                    let resource_metadata = resource_metadata.clone();
+                    async move {
+                        let authorization_header = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        resource_headers
+                            .lock()
+                            .expect("resource headers lock should not be poisoned")
+                            .push(authorization_header);
+                        Json(resource_metadata)
+                    }
+                }
+            }),
+        );
+        let resource_handle = tokio::spawn(async move {
+            axum::serve(resource_listener, resource_app)
+                .await
+                .expect("resource server should run");
+        });
+
+        HeaderCaptureServer {
+            url: format!("http://{resource_address}/mcp/"),
+            resource_authorization_headers,
+            issuer_authorization_headers,
+            handles: vec![issuer_handle, resource_handle],
+        }
+    }
+
     #[tokio::test]
     async fn discovers_metadata_from_protected_resource_path_with_trailing_slash() {
         let server = spawn_protected_resource_discovery_server().await;
@@ -267,6 +408,38 @@ mod tests {
         assert_eq!(
             discovery.scopes_supported,
             Some(vec!["openid".to_string(), " email ".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_send_caller_default_headers_to_authorization_server_metadata() {
+        let server = spawn_header_capture_discovery_server().await;
+        let base_url = Url::parse(&server.url).expect("server URL should parse");
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer private"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .default_headers(default_headers)
+            .build()
+            .expect("client should build");
+
+        discover_protected_resource_oauth_metadata(&client, &base_url)
+            .await
+            .expect("oauth metadata should be detected");
+
+        assert_eq!(
+            *server
+                .resource_authorization_headers
+                .lock()
+                .expect("resource headers lock should not be poisoned"),
+            vec![Some("Bearer private".to_string())]
+        );
+        assert_eq!(
+            *server
+                .issuer_authorization_headers
+                .lock()
+                .expect("issuer headers lock should not be poisoned"),
+            vec![None]
         );
     }
 }

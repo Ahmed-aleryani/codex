@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::string::String;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use urlencoding::decode;
 use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::oauth::compute_expires_at_millis;
+use crate::oauth_discovery::discover_authorization_metadata;
 use crate::oauth_discovery::discover_protected_resource_oauth_metadata;
 use crate::save_oauth_tokens;
 use crate::utils::apply_default_headers;
@@ -435,19 +437,98 @@ fn callback_path_from_redirect_uri(redirect_uri: &str) -> Result<String> {
     Ok(parsed.path().to_string())
 }
 
-fn callback_bind_host(callback_url: Option<&str>) -> &'static str {
-    let Some(callback_url) = callback_url else {
-        return "127.0.0.1";
+fn explicit_callback_url_port(callback_url: &str) -> Option<u16> {
+    let authority_start = callback_url.find("://")? + "://".len();
+    let authority = callback_url[authority_start..]
+        .split(['/', '?', '#'])
+        .next()?;
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let port = if let Some(without_opening_bracket) = host_port.strip_prefix('[') {
+        let (_, after_host) = without_opening_bracket.split_once(']')?;
+        after_host.strip_prefix(':')?
+    } else {
+        let (host, port) = host_port.rsplit_once(':')?;
+        if host.contains(':') {
+            return None;
+        }
+        port
     };
 
-    let Ok(parsed) = Url::parse(callback_url) else {
-        return "127.0.0.1";
-    };
-
-    match parsed.host_str() {
-        Some("localhost" | "127.0.0.1" | "::1") | None => "127.0.0.1",
-        Some(_) => "0.0.0.0",
+    if port.is_empty() {
+        return None;
     }
+
+    port.parse().ok()
+}
+
+fn callback_binding(
+    callback_url: Option<&str>,
+    callback_port: Option<u16>,
+) -> Result<(String, Option<u16>)> {
+    let callback_port = resolve_callback_port(callback_port)?;
+    let Some(callback_url) = callback_url else {
+        return Ok(("127.0.0.1".to_string(), callback_port));
+    };
+
+    let parsed = Url::parse(callback_url)
+        .with_context(|| format!("invalid MCP OAuth callback URL `{callback_url}`"))?;
+    if let Some(callback_port) = callback_port {
+        if parsed.scheme() == "http"
+            && let Some(host) = parsed.host_str()
+            && (host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .ok()
+                    .is_some_and(|ip| ip.is_loopback()))
+        {
+            let callback_url_port = explicit_callback_url_port(callback_url).ok_or_else(|| {
+                anyhow!(
+                    "MCP OAuth callback URL `{callback_url}` must include an explicit port when it uses localhost or a loopback IP address"
+                )
+            })?;
+            if callback_port != callback_url_port {
+                bail!(
+                    "MCP OAuth callback port `{callback_port}` must match the port in `mcp_oauth_callback_url` (`{callback_url_port}`)"
+                );
+            }
+        }
+        return Ok(("127.0.0.1".to_string(), Some(callback_port)));
+    }
+
+    if parsed.scheme() != "http" {
+        bail!(
+            "MCP OAuth callback URL `{callback_url}` requires `mcp_oauth_callback_port` because Codex cannot derive a local callback listener port from this URL"
+        );
+    }
+    let callback_url_port = explicit_callback_url_port(callback_url).ok_or_else(|| {
+        anyhow!(
+            "MCP OAuth callback URL `{callback_url}` must include an explicit port or set `mcp_oauth_callback_port`"
+        )
+    })?;
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("MCP OAuth callback URL `{callback_url}` must include a host"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(("127.0.0.1".to_string(), Some(callback_url_port)));
+    }
+
+    let host_ip = host.parse::<IpAddr>().with_context(|| {
+        format!(
+            "MCP OAuth callback URL `{callback_url}` requires `mcp_oauth_callback_port` unless it uses localhost or a loopback IP address with an explicit port"
+        )
+    })?;
+    if !host_ip.is_loopback() {
+        bail!(
+            "MCP OAuth callback URL `{callback_url}` requires `mcp_oauth_callback_port` unless it uses localhost or a loopback IP address with an explicit port"
+        );
+    }
+
+    let bind_host = match host_ip {
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) => format!("[{addr}]"),
+    };
+    Ok((bind_host, Some(callback_url_port)))
 }
 
 impl OauthLoginFlow {
@@ -468,8 +549,7 @@ impl OauthLoginFlow {
     ) -> Result<Self> {
         const DEFAULT_OAUTH_TIMEOUT_SECS: i64 = 300;
 
-        let bind_host = callback_bind_host(callback_url);
-        let callback_port = resolve_callback_port(callback_port)?;
+        let (bind_host, callback_port) = callback_binding(callback_url, callback_port)?;
         let bind_addr = match callback_port {
             Some(port) => format!("{bind_host}:{port}"),
             None => format!("{bind_host}:0"),
@@ -640,17 +720,15 @@ async fn start_authorization(
     };
 
     let mut auth_manager = AuthorizationManager::new(server_url).await?;
-    let fallback_client = http_client.clone();
-    auth_manager.with_client(http_client)?;
-    let metadata = match auth_manager.discover_metadata().await {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let base_url = Url::parse(server_url)?;
-            match discover_protected_resource_oauth_metadata(&fallback_client, &base_url).await {
-                Some(discovery) => discovery.authorization_metadata,
-                None => return Err(error.into()),
-            }
-        }
+    let base_url = Url::parse(server_url)?;
+    let metadata = if let Some(discovery) =
+        discover_protected_resource_oauth_metadata(&http_client, &base_url).await
+    {
+        discovery.authorization_metadata
+    } else if let Some(metadata) = discover_authorization_metadata(&http_client, &base_url).await {
+        metadata
+    } else {
+        auth_manager.discover_metadata().await?
     };
     auth_manager.set_metadata(metadata);
     auth_manager.configure_client(
@@ -685,9 +763,14 @@ fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
 mod tests {
     use axum::Json;
     use axum::Router;
+    use axum::http::HeaderMap as AxumHeaderMap;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use pretty_assertions::assert_eq;
     use reqwest::Url;
+    use reqwest::header::AUTHORIZATION;
+    use reqwest::header::HeaderMap;
+    use reqwest::header::HeaderValue;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -697,6 +780,7 @@ mod tests {
     use super::OauthLoginFlow;
     use super::append_callback_id_to_redirect_uri;
     use super::append_query_param;
+    use super::callback_binding;
     use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
     use super::parse_oauth_callback;
@@ -731,6 +815,45 @@ mod tests {
                     async move { Json(metadata) }
                 }),
             );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oauth metadata");
+        });
+
+        base_url
+    }
+
+    async fn spawn_header_required_oauth_metadata_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let addr = listener.local_addr().expect("read metadata listener addr");
+        let base_url = format!("http://{addr}");
+        let metadata = json!({
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "scopes_supported": [""],
+        });
+        let path_scoped_metadata = metadata;
+        let app = Router::new().route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(move |headers: AxumHeaderMap| {
+                let metadata = path_scoped_metadata.clone();
+                async move {
+                    if headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer private")
+                    {
+                        (StatusCode::OK, Json(metadata))
+                    } else {
+                        (StatusCode::UNAUTHORIZED, Json(json!({})))
+                    }
+                }
+            }),
+        );
 
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -782,6 +905,16 @@ mod tests {
         base_url
     }
 
+    async fn unused_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temporary listener");
+        listener
+            .local_addr()
+            .expect("read temporary listener addr")
+            .port()
+    }
+
     #[tokio::test]
     async fn start_authorization_uses_configured_client_id() {
         let base_url = spawn_oauth_metadata_server().await;
@@ -815,7 +948,40 @@ mod tests {
             &format!("{base_url}/mcp/"),
             reqwest::Client::new(),
             &[],
-            "http://localhost/callback",
+            "http://127.0.0.1:12345/callback",
+            Some("eci-prd-pub-codex-123"),
+        )
+        .await
+        .expect("start oauth authorization");
+
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .expect("read authorization url");
+        let auth_url = Url::parse(&authorization_url).expect("authorization url should parse");
+        let client_id = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(auth_url.path(), "/oauth/authorize");
+        assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
+
+    #[tokio::test]
+    async fn start_authorization_uses_configured_client_for_same_server_metadata() {
+        let base_url = spawn_header_required_oauth_metadata_server().await;
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer private"));
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .build()
+            .expect("client should build");
+        let oauth_state = start_authorization(
+            &format!("{base_url}/mcp"),
+            client,
+            &[],
+            "http://127.0.0.1:12345/callback",
             Some("eci-prd-pub-codex-123"),
         )
         .await
@@ -848,6 +1014,39 @@ mod tests {
     async fn explicit_callback_url_is_used_without_callback_id_path() {
         let base_url = spawn_oauth_metadata_server().await;
         let server_url = format!("{base_url}/mcp");
+        let callback_port = unused_loopback_port().await;
+        let callback_url = "https://callbacks.example.com/oauth/callback".to_string();
+        let flow = OauthLoginFlow::new(
+            "test-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            OauthHeaders {
+                http_headers: None,
+                env_http_headers: None,
+            },
+            &[],
+            Some("eci-prd-pub-codex-123"),
+            /*oauth_resource*/ None,
+            /*launch_browser*/ false,
+            Some(callback_port),
+            Some(&callback_url),
+            /*timeout_secs*/ Some(1),
+        )
+        .await
+        .expect("start oauth login flow");
+
+        let redirect_uri = authorization_redirect_uri(&flow.authorization_url());
+
+        assert_eq!(redirect_uri, callback_url);
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_url_without_callback_port_uses_url_port() {
+        let base_url = spawn_oauth_metadata_server().await;
+        let server_url = format!("{base_url}/mcp");
+        let callback_port = unused_loopback_port().await;
+        let callback_url = format!("http://127.0.0.1:{callback_port}/callback");
         let flow = OauthLoginFlow::new(
             "test-server",
             &server_url,
@@ -862,7 +1061,7 @@ mod tests {
             /*oauth_resource*/ None,
             /*launch_browser*/ false,
             /*callback_port*/ None,
-            Some("http://localhost/callback"),
+            Some(&callback_url),
             /*timeout_secs*/ Some(1),
         )
         .await
@@ -870,7 +1069,41 @@ mod tests {
 
         let redirect_uri = authorization_redirect_uri(&flow.authorization_url());
 
-        assert_eq!(redirect_uri, "http://localhost/callback");
+        assert_eq!(redirect_uri, callback_url);
+    }
+
+    #[tokio::test]
+    async fn explicit_callback_url_without_listener_port_is_rejected() {
+        let base_url = spawn_oauth_metadata_server().await;
+        let server_url = format!("{base_url}/mcp");
+        let result = OauthLoginFlow::new(
+            "test-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            OauthHeaders {
+                http_headers: None,
+                env_http_headers: None,
+            },
+            &[],
+            Some("eci-prd-pub-codex-123"),
+            /*oauth_resource*/ None,
+            /*launch_browser*/ false,
+            /*callback_port*/ None,
+            Some("http://127.0.0.1/callback"),
+            /*timeout_secs*/ Some(1),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("callback URL without a port should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("must include an explicit port or set `mcp_oauth_callback_port`")
+        );
     }
 
     #[tokio::test]
@@ -960,6 +1193,35 @@ mod tests {
         let path = callback_path_from_redirect_uri("https://example.com/oauth/callback")
             .expect("redirect URI should parse");
         assert_eq!(path, "/oauth/callback");
+    }
+
+    #[test]
+    fn callback_binding_accepts_explicit_default_http_port() {
+        let binding = callback_binding(Some("http://127.0.0.1:80/callback"), None)
+            .expect("explicit default port should be accepted");
+        assert_eq!(binding, ("127.0.0.1".to_string(), Some(80)));
+    }
+
+    #[test]
+    fn callback_binding_rejects_mismatched_loopback_callback_port() {
+        let error = callback_binding(Some("http://localhost:4317/callback"), Some(4318))
+            .expect_err("mismatched loopback callback port should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must match the port in `mcp_oauth_callback_url`")
+        );
+    }
+
+    #[test]
+    fn callback_binding_uses_configured_port_for_public_callback_url() {
+        let binding = callback_binding(
+            Some("https://callbacks.example.com/oauth/callback"),
+            Some(4317),
+        )
+        .expect("configured callback port should be accepted");
+        assert_eq!(binding, ("127.0.0.1".to_string(), Some(4317)));
     }
 
     #[test]
