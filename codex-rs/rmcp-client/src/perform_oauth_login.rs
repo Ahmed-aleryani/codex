@@ -26,6 +26,7 @@ use urlencoding::decode;
 use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::oauth::compute_expires_at_millis;
+use crate::oauth_discovery::discover_protected_resource_oauth_metadata;
 use crate::save_oauth_tokens;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
@@ -480,8 +481,12 @@ impl OauthLoginFlow {
         };
 
         let redirect_uri = resolve_redirect_uri(&server, callback_url)?;
-        let callback_id = callback_id_from_server_url(server_url)?;
-        let redirect_uri = append_callback_id_to_redirect_uri(&redirect_uri, &callback_id)?;
+        let redirect_uri = if callback_url.is_some() {
+            redirect_uri
+        } else {
+            let callback_id = callback_id_from_server_url(server_url)?;
+            append_callback_id_to_redirect_uri(&redirect_uri, &callback_id)?
+        };
         let callback_path = callback_path_from_redirect_uri(&redirect_uri)?;
 
         let (tx, rx) = oneshot::channel();
@@ -635,8 +640,18 @@ async fn start_authorization(
     };
 
     let mut auth_manager = AuthorizationManager::new(server_url).await?;
+    let fallback_client = http_client.clone();
     auth_manager.with_client(http_client)?;
-    let metadata = auth_manager.discover_metadata().await?;
+    let metadata = match auth_manager.discover_metadata().await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let base_url = Url::parse(server_url)?;
+            match discover_protected_resource_oauth_metadata(&fallback_client, &base_url).await {
+                Some(discovery) => discovery.authorization_metadata,
+                None => return Err(error.into()),
+            }
+        }
+    };
     auth_manager.set_metadata(metadata);
     auth_manager.configure_client(
         OAuthClientConfig::new(oauth_client_id, redirect_uri)
@@ -678,12 +693,16 @@ mod tests {
 
     use super::CallbackOutcome;
     use super::OAuthProviderError;
+    use super::OauthHeaders;
+    use super::OauthLoginFlow;
     use super::append_callback_id_to_redirect_uri;
     use super::append_query_param;
     use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
     use super::parse_oauth_callback;
     use super::start_authorization;
+    use codex_config::types::AuthKeyringBackendKind;
+    use codex_config::types::OAuthCredentialsStoreMode;
 
     async fn spawn_oauth_metadata_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -722,6 +741,47 @@ mod tests {
         base_url
     }
 
+    async fn spawn_protected_resource_metadata_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let addr = listener.local_addr().expect("read metadata listener addr");
+        let base_url = format!("http://{addr}");
+        let resource_metadata = json!({
+            "authorization_servers": [format!("{base_url}/issuer")],
+        });
+        let authorization_metadata = json!({
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "scopes_supported": [""],
+        });
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp/",
+                get({
+                    move || {
+                        let resource_metadata = resource_metadata.clone();
+                        async move { Json(resource_metadata) }
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server/issuer",
+                get(move || {
+                    let authorization_metadata = authorization_metadata.clone();
+                    async move { Json(authorization_metadata) }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oauth metadata");
+        });
+
+        base_url
+    }
+
     #[tokio::test]
     async fn start_authorization_uses_configured_client_id() {
         let base_url = spawn_oauth_metadata_server().await;
@@ -746,6 +806,106 @@ mod tests {
             .map(|(_, value)| value.into_owned());
 
         assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
+
+    #[tokio::test]
+    async fn start_authorization_falls_back_to_protected_resource_metadata() {
+        let base_url = spawn_protected_resource_metadata_server().await;
+        let oauth_state = start_authorization(
+            &format!("{base_url}/mcp/"),
+            reqwest::Client::new(),
+            &[],
+            "http://localhost/callback",
+            Some("eci-prd-pub-codex-123"),
+        )
+        .await
+        .expect("start oauth authorization");
+
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .expect("read authorization url");
+        let auth_url = Url::parse(&authorization_url).expect("authorization url should parse");
+        let client_id = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(auth_url.path(), "/oauth/authorize");
+        assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
+
+    fn authorization_redirect_uri(authorization_url: &str) -> String {
+        let auth_url = Url::parse(authorization_url).expect("authorization url should parse");
+        auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization url should include redirect_uri")
+    }
+
+    #[tokio::test]
+    async fn explicit_callback_url_is_used_without_callback_id_path() {
+        let base_url = spawn_oauth_metadata_server().await;
+        let server_url = format!("{base_url}/mcp");
+        let flow = OauthLoginFlow::new(
+            "test-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            OauthHeaders {
+                http_headers: None,
+                env_http_headers: None,
+            },
+            &[],
+            Some("eci-prd-pub-codex-123"),
+            /*oauth_resource*/ None,
+            /*launch_browser*/ false,
+            /*callback_port*/ None,
+            Some("http://localhost/callback"),
+            /*timeout_secs*/ Some(1),
+        )
+        .await
+        .expect("start oauth login flow");
+
+        let redirect_uri = authorization_redirect_uri(&flow.authorization_url());
+
+        assert_eq!(redirect_uri, "http://localhost/callback");
+    }
+
+    #[tokio::test]
+    async fn generated_callback_url_keeps_callback_id_path() {
+        let base_url = spawn_oauth_metadata_server().await;
+        let server_url = format!("{base_url}/mcp");
+        let flow = OauthLoginFlow::new(
+            "test-server",
+            &server_url,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            OauthHeaders {
+                http_headers: None,
+                env_http_headers: None,
+            },
+            &[],
+            Some("eci-prd-pub-codex-123"),
+            /*oauth_resource*/ None,
+            /*launch_browser*/ false,
+            /*callback_port*/ None,
+            /*callback_url*/ None,
+            /*timeout_secs*/ Some(1),
+        )
+        .await
+        .expect("start oauth login flow");
+
+        let redirect_uri = authorization_redirect_uri(&flow.authorization_url());
+        let parsed_redirect =
+            Url::parse(&redirect_uri).expect("redirect_uri should parse as a URL");
+        let callback_id =
+            callback_id_from_server_url(&server_url).expect("server URL should have callback id");
+
+        assert_eq!(parsed_redirect.host_str(), Some("127.0.0.1"));
+        assert!(parsed_redirect.port().is_some());
+        assert_eq!(parsed_redirect.path(), format!("/callback/{callback_id}"));
     }
 
     #[test]
