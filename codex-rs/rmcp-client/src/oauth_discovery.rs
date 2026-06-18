@@ -10,6 +10,7 @@ use tracing::debug;
 const OAUTH_DISCOVERY_HEADER: &str = "MCP-Protocol-Version";
 const OAUTH_DISCOVERY_VERSION: &str = "2024-11-05";
 const OAUTH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AUTHORIZATION_SERVERS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProtectedResourceOAuthDiscovery {
@@ -137,6 +138,7 @@ fn authorization_servers(resource_metadata: &ResourceMetadata) -> Vec<Url> {
     candidates
         .into_iter()
         .filter_map(|server| Url::parse(server.trim()).ok())
+        .take(MAX_AUTHORIZATION_SERVERS)
         .collect()
 }
 
@@ -383,6 +385,53 @@ mod tests {
         }
     }
 
+    async fn spawn_excess_authorization_servers_discovery_server() -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let authorization_servers: Vec<String> = (0..=MAX_AUTHORIZATION_SERVERS)
+            .map(|index| format!("http://{address}/issuer-{index}"))
+            .collect();
+        let resource_metadata = json!({
+            "resource": format!("http://{address}/mcp/"),
+            "authorization_servers": authorization_servers,
+        });
+        let authorization_metadata = json!({
+            "authorization_endpoint": format!("http://{address}/oauth/authorize"),
+            "token_endpoint": format!("http://{address}/oauth/token"),
+        });
+        let capped_out_issuer_path =
+            format!("/.well-known/oauth-authorization-server/issuer-{MAX_AUTHORIZATION_SERVERS}");
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp/",
+                get({
+                    move || {
+                        let resource_metadata = resource_metadata.clone();
+                        async move { Json(resource_metadata) }
+                    }
+                }),
+            )
+            .route(
+                &capped_out_issuer_path,
+                get({
+                    move || {
+                        let authorization_metadata = authorization_metadata.clone();
+                        async move { Json(authorization_metadata) }
+                    }
+                }),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        TestServer {
+            url: format!("http://{address}/mcp/"),
+            handle,
+        }
+    }
+
     #[tokio::test]
     async fn discovers_metadata_from_protected_resource_path_with_trailing_slash() {
         let server = spawn_protected_resource_discovery_server().await;
@@ -409,6 +458,20 @@ mod tests {
             discovery.scopes_supported,
             Some(vec!["openid".to_string(), " email ".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn limits_authorization_server_candidates() {
+        let server = spawn_excess_authorization_servers_discovery_server().await;
+        let base_url = Url::parse(&server.url).expect("server URL should parse");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client should build");
+
+        let discovery = discover_protected_resource_oauth_metadata(&client, &base_url).await;
+
+        assert!(discovery.is_none());
     }
 
     #[tokio::test]
