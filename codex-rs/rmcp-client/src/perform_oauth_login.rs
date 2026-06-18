@@ -461,6 +461,29 @@ fn explicit_callback_url_port(callback_url: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+fn loopback_bind_host(host: &str, callback_url: &str) -> Result<String> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+
+    let host_ip = host.parse::<IpAddr>().map_err(|_| {
+        anyhow!(
+            "MCP OAuth callback URL `{callback_url}` must use `https` unless it uses localhost or a loopback IP address"
+        )
+    })?;
+    if !host_ip.is_loopback() {
+        bail!(
+            "MCP OAuth callback URL `{callback_url}` must use `https` unless it uses localhost or a loopback IP address"
+        );
+    }
+
+    let bind_host = match host_ip {
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) => format!("[{addr}]"),
+    };
+    Ok(bind_host)
+}
+
 fn callback_binding(
     callback_url: Option<&str>,
     callback_port: Option<u16>,
@@ -473,26 +496,29 @@ fn callback_binding(
     let parsed = Url::parse(callback_url)
         .with_context(|| format!("invalid MCP OAuth callback URL `{callback_url}`"))?;
     if let Some(callback_port) = callback_port {
-        if parsed.scheme() == "http"
-            && let Some(host) = parsed.host_str()
-            && (host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .ok()
-                    .is_some_and(|ip| ip.is_loopback()))
-        {
-            let callback_url_port = explicit_callback_url_port(callback_url).ok_or_else(|| {
-                anyhow!(
-                    "MCP OAuth callback URL `{callback_url}` must include an explicit port when it uses localhost or a loopback IP address"
-                )
-            })?;
-            if callback_port != callback_url_port {
-                bail!(
-                    "MCP OAuth callback port `{callback_port}` must match the port in `mcp_oauth_callback_url` (`{callback_url_port}`)"
-                );
-            }
+        if parsed.scheme() == "https" {
+            return Ok(("127.0.0.1".to_string(), Some(callback_port)));
         }
-        return Ok(("127.0.0.1".to_string(), Some(callback_port)));
+        if parsed.scheme() != "http" {
+            bail!(
+                "MCP OAuth callback URL `{callback_url}` must use `https` or `http` with localhost or a loopback IP address"
+            );
+        }
+        let host = parsed.host_str().ok_or_else(|| {
+            anyhow!("MCP OAuth callback URL `{callback_url}` must include a host")
+        })?;
+        let bind_host = loopback_bind_host(host, callback_url)?;
+        let callback_url_port = explicit_callback_url_port(callback_url).ok_or_else(|| {
+            anyhow!(
+                "MCP OAuth callback URL `{callback_url}` must include an explicit port when it uses localhost or a loopback IP address"
+            )
+        })?;
+        if callback_port != callback_url_port {
+            bail!(
+                "MCP OAuth callback port `{callback_port}` must match the port in `mcp_oauth_callback_url` (`{callback_url_port}`)"
+            );
+        }
+        return Ok((bind_host, Some(callback_port)));
     }
 
     if parsed.scheme() != "http" {
@@ -509,25 +535,7 @@ fn callback_binding(
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("MCP OAuth callback URL `{callback_url}` must include a host"))?;
-    if host.eq_ignore_ascii_case("localhost") {
-        return Ok(("127.0.0.1".to_string(), Some(callback_url_port)));
-    }
-
-    let host_ip = host.parse::<IpAddr>().with_context(|| {
-        format!(
-            "MCP OAuth callback URL `{callback_url}` requires `mcp_oauth_callback_port` unless it uses localhost or a loopback IP address with an explicit port"
-        )
-    })?;
-    if !host_ip.is_loopback() {
-        bail!(
-            "MCP OAuth callback URL `{callback_url}` requires `mcp_oauth_callback_port` unless it uses localhost or a loopback IP address with an explicit port"
-        );
-    }
-
-    let bind_host = match host_ip {
-        IpAddr::V4(addr) => addr.to_string(),
-        IpAddr::V6(addr) => format!("[{addr}]"),
-    };
+    let bind_host = loopback_bind_host(host, callback_url)?;
     Ok((bind_host, Some(callback_url_port)))
 }
 
@@ -1211,6 +1219,18 @@ mod tests {
             error
                 .to_string()
                 .contains("must match the port in `mcp_oauth_callback_url`")
+        );
+    }
+
+    #[test]
+    fn callback_binding_rejects_non_loopback_http_callback_url() {
+        let error = callback_binding(Some("http://example.com:4317/callback"), Some(4317))
+            .expect_err("non-loopback HTTP callback URL should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must use `https` unless it uses localhost or a loopback IP address")
         );
     }
 
