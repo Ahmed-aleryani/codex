@@ -347,6 +347,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_streamable_http_oauth_follows_well_known_protected_resource_metadata() {
+        let authorization_server = spawn_oauth_discovery_server(serde_json::json!({
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+            "scopes_supported": ["read", " write ", "read"],
+        }))
+        .await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let authorization_server_url = authorization_server.url.clone();
+        let app = Router::new().route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(move || {
+                let authorization_server_url = authorization_server_url.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "resource": format!("http://{address}/mcp"),
+                        "authorization_servers": [authorization_server_url],
+                    }))
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        let resource_server = TestServer {
+            url: format!("http://{address}/mcp"),
+            handle,
+        };
+
+        let discovery = discover_streamable_http_oauth(
+            &resource_server.url,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+        )
+        .await
+        .expect("discovery should succeed")
+        .expect("oauth support should be detected");
+        let status = determine_streamable_http_auth_status(
+            "well-known-protected-resource-test",
+            &resource_server.url,
+            /*bearer_token_env_var*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .await
+        .expect("status should compute");
+
+        assert_eq!(
+            discovery.scopes_supported,
+            Some(vec!["read".to_string(), "write".to_string()])
+        );
+        assert_eq!(status, McpAuthStatus::NotLoggedIn);
+    }
+
+    #[tokio::test]
     async fn discover_streamable_http_oauth_ignores_empty_scopes() {
         let server = spawn_oauth_discovery_server(serde_json::json!({
             "authorization_endpoint": "https://example.com/authorize",

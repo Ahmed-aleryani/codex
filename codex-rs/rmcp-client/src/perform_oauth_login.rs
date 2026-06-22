@@ -14,6 +14,7 @@ use reqwest::ClientBuilder;
 use reqwest::Url;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
+use rmcp::transport::auth::AuthError;
 use rmcp::transport::auth::OAuthClientConfig;
 use rmcp::transport::auth::OAuthState;
 use sha2::Digest;
@@ -720,11 +721,41 @@ async fn start_authorization(
 ) -> Result<OAuthState> {
     let Some(oauth_client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty())
     else {
-        let mut oauth_state = OAuthState::new(server_url, Some(http_client)).await?;
-        oauth_state
+        let mut oauth_state = OAuthState::new(server_url, Some(http_client.clone())).await?;
+        match oauth_state
             .start_authorization(scopes, redirect_uri, Some("Codex"))
+            .await
+        {
+            Ok(()) => return Ok(oauth_state),
+            Err(AuthError::NoAuthorizationSupport) => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        let mut auth_manager = AuthorizationManager::new(server_url).await?;
+        auth_manager.with_client(http_client.clone())?;
+        let base_url = Url::parse(server_url)?;
+        if let Some(discovery) =
+            discover_protected_resource_oauth_metadata(&http_client, &base_url).await
+        {
+            auth_manager.set_metadata(discovery.authorization_metadata);
+            let selected_scopes = if scopes.is_empty() {
+                auth_manager.select_scopes(None, &[])
+            } else {
+                scopes.iter().map(|scope| (*scope).to_string()).collect()
+            };
+            let scope_refs: Vec<&str> = selected_scopes.iter().map(String::as_str).collect();
+            let session = AuthorizationSession::new(
+                auth_manager,
+                &scope_refs,
+                redirect_uri,
+                Some("Codex"),
+                None,
+            )
             .await?;
-        return Ok(oauth_state);
+            return Ok(OAuthState::Session(session));
+        }
+
+        return Err(AuthError::NoAuthorizationSupport.into());
     };
 
     let mut auth_manager = AuthorizationManager::new(server_url).await?;
@@ -736,6 +767,7 @@ async fn start_authorization(
     } else if let Some(metadata) = discover_authorization_metadata(&http_client, &base_url).await {
         metadata
     } else {
+        auth_manager.with_client(http_client)?;
         auth_manager.discover_metadata().await?
     };
     auth_manager.set_metadata(metadata);
@@ -779,6 +811,7 @@ mod tests {
     use reqwest::header::AUTHORIZATION;
     use reqwest::header::HeaderMap;
     use reqwest::header::HeaderValue;
+    use reqwest::header::WWW_AUTHENTICATE;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -793,6 +826,7 @@ mod tests {
     use super::callback_path_from_redirect_uri;
     use super::parse_oauth_callback;
     use super::start_authorization;
+    use axum::routing::post;
     use codex_config::types::AuthKeyringBackendKind;
     use codex_config::types::OAuthCredentialsStoreMode;
 
@@ -913,6 +947,145 @@ mod tests {
         base_url
     }
 
+    async fn spawn_trailing_slash_protected_resource_registration_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let addr = listener.local_addr().expect("read metadata listener addr");
+        let base_url = format!("http://{addr}");
+        let resource_metadata = json!({
+            "authorization_servers": [format!("{base_url}/issuer")],
+        });
+        let authorization_metadata = json!({
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "registration_endpoint": format!("{base_url}/oauth/register"),
+            "scopes_supported": ["email"],
+        });
+        let registration_response = json!({
+            "client_id": "registered-client-id",
+            "client_secret": null,
+            "client_name": "Codex",
+            "redirect_uris": ["http://127.0.0.1:12345/callback"],
+        });
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp/",
+                get({
+                    move || {
+                        let resource_metadata = resource_metadata.clone();
+                        async move { Json(resource_metadata) }
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server/issuer",
+                get({
+                    move || {
+                        let authorization_metadata = authorization_metadata.clone();
+                        async move { Json(authorization_metadata) }
+                    }
+                }),
+            )
+            .route(
+                "/oauth/register",
+                post(move || {
+                    let registration_response = registration_response.clone();
+                    async move { Json(registration_response) }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oauth metadata");
+        });
+
+        base_url
+    }
+
+    async fn spawn_www_auth_header_required_metadata_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let addr = listener.local_addr().expect("read metadata listener addr");
+        let base_url = format!("http://{addr}");
+        let resource_metadata_url = format!("{base_url}/oauth-resource");
+        let challenge = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+        let resource_metadata = json!({
+            "authorization_servers": [format!("{base_url}/issuer")],
+        });
+        let authorization_metadata = json!({
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "scopes_supported": [""],
+        });
+        let app = Router::new()
+            .route(
+                "/mcp",
+                get(move |headers: AxumHeaderMap| {
+                    let challenge = challenge.clone();
+                    async move {
+                        let mut response_headers = AxumHeaderMap::new();
+                        if headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer private")
+                        {
+                            response_headers.insert(
+                                WWW_AUTHENTICATE,
+                                HeaderValue::from_str(&challenge)
+                                    .expect("challenge header should be valid"),
+                            );
+                        }
+                        (StatusCode::UNAUTHORIZED, response_headers)
+                    }
+                }),
+            )
+            .route(
+                "/oauth-resource",
+                get(move |headers: AxumHeaderMap| {
+                    let resource_metadata = resource_metadata.clone();
+                    async move {
+                        if headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer private")
+                        {
+                            (StatusCode::OK, Json(resource_metadata))
+                        } else {
+                            (StatusCode::UNAUTHORIZED, Json(json!({})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server/issuer",
+                get(move |headers: AxumHeaderMap| {
+                    let authorization_metadata = authorization_metadata.clone();
+                    async move {
+                        if headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer private")
+                        {
+                            (StatusCode::OK, Json(authorization_metadata))
+                        } else {
+                            (StatusCode::UNAUTHORIZED, Json(json!({})))
+                        }
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oauth metadata");
+        });
+
+        base_url
+    }
+
     async fn unused_loopback_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -977,8 +1150,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_authorization_without_client_id_uses_trailing_slash_protected_resource_metadata()
+    {
+        let base_url = spawn_trailing_slash_protected_resource_registration_server().await;
+        let oauth_state = start_authorization(
+            &format!("{base_url}/mcp/"),
+            reqwest::Client::new(),
+            &[],
+            "http://127.0.0.1:12345/callback",
+            /*oauth_client_id*/ None,
+        )
+        .await
+        .expect("start oauth authorization");
+
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .expect("read authorization url");
+        let auth_url = Url::parse(&authorization_url).expect("authorization url should parse");
+        let client_id = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(auth_url.path(), "/oauth/authorize");
+        assert_eq!(client_id.as_deref(), Some("registered-client-id"));
+    }
+
+    #[tokio::test]
     async fn start_authorization_uses_configured_client_for_same_server_metadata() {
         let base_url = spawn_header_required_oauth_metadata_server().await;
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer private"));
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .build()
+            .expect("client should build");
+        let oauth_state = start_authorization(
+            &format!("{base_url}/mcp"),
+            client,
+            &[],
+            "http://127.0.0.1:12345/callback",
+            Some("eci-prd-pub-codex-123"),
+        )
+        .await
+        .expect("start oauth authorization");
+
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .expect("read authorization url");
+        let auth_url = Url::parse(&authorization_url).expect("authorization url should parse");
+        let client_id = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(auth_url.path(), "/oauth/authorize");
+        assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
+
+    #[tokio::test]
+    async fn start_authorization_uses_configured_client_for_rmcp_metadata_fallback() {
+        let base_url = spawn_www_auth_header_required_metadata_server().await;
         let mut default_headers = HeaderMap::new();
         default_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer private"));
         let client = reqwest::Client::builder()
